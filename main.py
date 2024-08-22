@@ -2,6 +2,7 @@ import pywinusb.hid as hid
 from time import sleep
 from threading import Thread, Event
 import wx
+import wx.media
 import pyaudio
 import wave
 
@@ -14,19 +15,30 @@ audio_thread = None
 total_frames = 0
 screen_size = (1000, 700)
 
-class Dialog(wx.Frame):
+# Constants for button IDs
+FT_ALL_ID = 0xFFFF
+FT_MID_ID = 1 << 2
+FT_LEFT_ID = 1 << 0
+FT_RIGHT_ID = 1 << 1
+FT_NONE_ID = 0
+FT_LR_ID = FT_LEFT_ID | FT_RIGHT_ID
+FT_RMID_ID = FT_RIGHT_ID | FT_MID_ID
+FT_LMID_ID = FT_LEFT_ID | FT_MID_ID
+
+class Frame(wx.Frame):
 
     def __init__(self, parent, title):
-        super(Dialog, self).__init__(parent, title=title, size=screen_size,
+        super(Frame, self).__init__(parent, title=title, size=screen_size,
                                      style=wx.SYSTEM_MENU | wx.CAPTION | wx.CLOSE_BOX)
-
+        self.is_playing = False
+        # Initialize UI
         self.InitUI()
+
         self.Centre()
         self.Show()
         
         # Bind the close event to onExit
         self.Bind(wx.EVT_CLOSE, self.onExit)
-
 
     def InitUI(self):
 
@@ -49,6 +61,9 @@ class Dialog(wx.Frame):
         aboutMenuItem = helpMenu.Append(wx.NewId(), "&About", "About this program")
         helpMenuItem = helpMenu.Append(wx.NewId(), "How &To", "Get Help using this program.")
 
+        usb_thread = UsbHandler(self)
+        usb_thread.start()
+
         self.SetMenuBar(menuBar)
 
         self.Bind(wx.EVT_MENU, self.onExit, exitMenuItem)
@@ -64,6 +79,15 @@ class Dialog(wx.Frame):
 
         self.filelabel = wx.StaticText(panel, label="No file selected")
         virtBox.Add(self.filelabel, 0, wx.ALL | wx.CENTER, 5)
+
+        self.media = wx.media.MediaCtrl(panel, style=wx.NO_BORDER)
+
+        self.play_pause_button = wx.Button(panel, label="Play/Pause")
+        self.play_pause_button.Bind(wx.EVT_BUTTON, self.OnPlayPause)
+
+        # Layout the controls on the frame
+        virtBox.Add(self.media, 0, wx.ALL | wx.CENTER, 5)
+        virtBox.Add(self.play_pause_button, 0, wx.ALL, wx.CENTER, 5)
 
         # Scrubber for audio position
         self.scrubber = LabeledSlider(panel, value=0, minValue=0, maxValue=100, size=(350,-1), style=wx.SL_HORIZONTAL)
@@ -90,6 +114,7 @@ class Dialog(wx.Frame):
             # Proceed loading the file chosen by the user
             global file_path, total_frames, audio_position, wf
             file_path = fileDialog.GetPath()
+            self.media.Load(fileName=file_path)
             self.filelabel.SetLabel(f"Selected: {file_path}")
 
             # Get total frames
@@ -119,6 +144,20 @@ class Dialog(wx.Frame):
             wf.setpos(audio_position)
         print(f'Scrubbed to frame {audio_position}')
 
+    def OnPlayPause(self, event):
+        if not file_path:
+            wx.MessageBox("Please select a file first")
+            return
+
+        if not self.is_playing:
+            self.media.Play()
+            self.play_pause_button.SetLabel("Pause")
+            self.is_playing = True
+        else:
+            self.media.Pause()
+            self.play_pause_button.SetLabel("Play")
+            self.is_playing = False
+
     def onExit(self, event):
         gui_closed.set()
         playback_control.clear()
@@ -136,83 +175,96 @@ class LabeledSlider(wx.Slider):
     def SetMaxLabel(self, label):
         self.max_label.SetLabel(label)
 
-def usb_handler(data):
+class UsbHandler(Thread):
+    def __init__(self, parent):
+        super().__init__()
+        self.parent = parent
+        self.devices = None
+        self.gui_closed = Event()
+        self.p = None
+        self.stream = None
+        self.audio_data = bytearray(1024) # Buffer for audio data
 
-    FT_NONE_ID = 0
-    FT_LEFT_ID = 1
-    FT_MID_ID  = 2
-    FT_RIGHT_ID= 4
-    FT_LMID_ID = FT_LEFT_ID + FT_MID_ID
-    FT_RMID_ID = FT_RIGHT_ID + FT_MID_ID
-    FT_LR_ID = FT_LEFT_ID + FT_RIGHT_ID
-    FT_ALL = FT_LEFT_ID + FT_RIGHT_ID + FT_MID_ID
+    def run(self):
+        self.usb_pedal()
 
-    button_map = {
-        FT_ALL: "ALL Depressed",
-        FT_LR_ID: "Left + Right Depressed",
-        FT_RMID_ID: "Right + Middle Depressed",
-        FT_RIGHT_ID: "Right Depressed",
-        FT_LMID_ID: "Left + Middle Depressed",
-        FT_MID_ID: "Middle Depressed",
-        FT_LEFT_ID: "Left Depressed",
-        FT_NONE_ID: "None Depressed"
-    }
-
-    button_status = button_map.get(data[1], "Unknown State")
-    print("\nRaw data: {0}, GUI Closed: {1}, Status: {2}".format(data[1], gui_closed.is_set(), button_status))
-
-
-    # Depending on Button pressed, control playback
-    if data[1] == FT_MID_ID:
-        if playback_control.is_set():
-            playback_control.clear()
-        else:
-            playback_control.set()
-            start_audio_thread()
+    def usb_handler(self, data):
+        if data:
+            self.audio_data.extend(data)
+        # Depending on Button pressed, control playback
+        if data[1] == FT_MID_ID:
+            if playback_control.is_set():
+                playback_control.clear()
+            else:
+                playback_control.set()
+                start_audio_thread()
     
-    elif data[1] == FT_RIGHT_ID:
-        fast_forward()
-    
-    elif data[1] == FT_LEFT_ID:
-        rewind()
+        elif data[1] == FT_RIGHT_ID:
+            pass
 
-    return data[1]
+        elif data[1] == FT_LEFT_ID:
+            pass
 
-def fast_forward():
-    global audio_position
-    audio_position += 5 * 1024 # Skip 5 chunks ahead
-    if audio_position > total_frames:
-        audio_position = total_frames
+        return data[1]
 
-def rewind():
-    global audio_position
-    audio_position -= 5 * 1024 # Go back 5 chunks
-    if audio_position < 0:
-        audio_position = 0
-    
+    def play_audio(self):
+        play_audio()
 
-def usb_pedal():
-    devices = hid.HidDeviceFilter(vendor_id=vendor_id, product_id=product_id).get_devices()
-    if devices:
-        device = devices[0]
+    def fake(self):
+        chunk = 1024
+        format = pyaudio.paFloat32
+        channels = 2
+        rate = 44100
+        
+        self.p = pyaudio.PyAudio()
+
+        self.stream = self.p.open(
+            format=format,
+            channels=channels,
+            rate=rate,
+            output=True
+        )
+
+        while not self.gui_closed.is_set():
+            if len(self.audio_data) >= chunk:
+                audio_frame = self.audio_data[:chunk]
+                del self.audio_data[:chunk]
+                self.stream.write(audio_frame)
+
+    def usb_pedal(self):
+        self.devices = hid.HidDeviceFilter(vendor_id=vendor_id, product_id=product_id).get_devices()
+        if not self.devices:
+            print('No USB devices found')
+            return
+
+        device = self.devices[0]
         print("Found Device", device)
 
         device.open()
-        device.set_raw_data_handler(usb_handler)
+        device.set_raw_data_handler(self.usb_handler)
+        
+        audio_thread = Thread(target=self.play_audio)
+        audio_thread.start()
+
         while device.is_plugged():
             # just keep the device opened to receive events
             if gui_closed == True:
                 break
-            sleep(0.5)
+            sleep(0.1)
         device.close()
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+        self.p.terminate()
+
+    def stop(self):
+        self.gui_closed.is_set()
 
 def frames_to_timestamp(frame_count, sample_rate):
     total_seconds = frame_count // sample_rate
     minutes = total_seconds // 60
     seconds = total_seconds % 60
     return f'{minutes:02}:{seconds:02}'
-
-    
 
 def play_audio():
     if file_path is None:
@@ -257,8 +309,37 @@ def update_scrubber_and_timestamp():
     # Update scrubber tooltip and label
     wx.CallAfter(wx.GetApp().GetTopWindow().scrubber.SetToolTip, f'{current_timestamp} / {total_timestamp}')
     wx.CallAfter(wx.GetApp().GetTopWindow().scrubber.SetMinLabel, f'{current_timestamp}')
-    #wx.CallAfter(wx.GetApp().GetTopWindow().scrubber.SetMaxLabel(total_timestamp))
 
+class AudioPlayerThread(Thread):
+    def __init__(self, media, file_path) -> None:
+        super().__init__()
+        self.media = media
+        self.file_path = file_path
+        self.is_paused = False
+        self.event = Event()
+
+    def run(self):
+        self.media.Load(self.file_path)
+        while not self.event.is_set():
+            if not self.is_paused:
+                self.media.Play()
+                wx.Yield()
+            else:
+                self.media.Pause()
+                self.event.wait()
+
+    def pause(self):
+        self.is_paused = True
+        self.media.Pause()
+
+    def resume(self):
+        self.is_paused = False
+        self.media.Play()
+
+    def stop(self):
+        self.event.set()
+        self.media.Stop()
+        
 
 def start_audio_thread():
     global audio_thread
@@ -268,14 +349,11 @@ def start_audio_thread():
 
 def startUI():
     app = wx.App()
-    Dialog(None, title="USB Foot Pedal Playback Program")
+    Frame(None, title="USB Foot Pedal Playback Program")
     app.MainLoop()
 
 if __name__ == "__main__":
-    usb_thread = Thread(target=usb_pedal)
-    usb_thread.start()
     startUI()
-    usb_thread.join()
     if audio_thread is not None:
         audio_thread.join()
 
